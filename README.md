@@ -4,7 +4,7 @@ This repo provides a demonstration the concept of creating RelWeights.
 
 ## Setup
 
-Download/Clone this repo using 
+Download/Clone this repo using [https://github.com/shamilkhedgikar/RelWeights.git]
 
 ## Theory
 
