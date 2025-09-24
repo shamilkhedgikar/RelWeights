@@ -39,3 +39,4 @@ source("relweights_sfdep.R")
 
 tab2relweights_spdep(rel_layer = rel_layer, inh_layer = inh_layer, output_gal = "relweights_sample_new.gal")
 
+tab2relweights_sfdep(rel_layer = rel_layer, inh_layer = inh_layer, style = "W", binary = TRUE, zero.policy = TRUE, output_gal = "relweights_sample_new_sfdep_v2.gal")

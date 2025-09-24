@@ -1,30 +1,3 @@
-#' Compute Relational Weights using sfdep
-#'
-#' This implementation constructs relational weights and returns structures that
-#' integrate with the `sfdep` workflow. A custom GAL writer is provided so users can
-#' persist the neighbour graph without relying on `spdep`.
-#'
-#' @param rel_layer sf object; the layer inheriting neighbours.
-#' @param inh_layer sf object; the layer inducing inherited connections.
-#' @param style Character; currently supports "W" (row-standardised) and "B" (binary).
-#' @param binary Logical; when TRUE (default) cell values greater than zero collapse to 1 prior to
-#'   applying the chosen style.
-#' @param zero.policy Logical; when FALSE the presence of zero-neighbour observations triggers an
-#'   error when style = "W" and a row standardisation would divide by zero.
-#' @param ids Optional character vector of identifiers to label the rows when exporting.
-#' @param output_gal Optional path; when provided a GAL file is written using the computed
-#'   neighbour structure.
-#'
-#' @return A list containing the dense relational matrix, the raw weights matrix, the row-standardised
-#'   (or binary) weights matrix used to build sfdep objects, the neighbour list with class `nb`, a list of
-#'   weights compatible with sfdep, a recreated listw object, and a data.frame with id/nb/weight columns
-#'   for tidy workflows.
-#' @export
-#'
-#' @examples
-#' # result <- tab2relweights_sfdep(rel_sf, inh_sf, output_gal = "RelWeights.gal")
-#' # result$nb  # sfdep-compatible neighbour list
-
 tab2relweights_sfdep <- function(rel_layer,
                                  inh_layer,
                                  style = c("W", "B"),
@@ -33,6 +6,7 @@ tab2relweights_sfdep <- function(rel_layer,
                                  ids = NULL,
                                  output_gal = NULL) {
   style <- match.arg(style)
+  call_expr <- match.call()
 
   if (!requireNamespace("sf", quietly = TRUE)) {
     stop("Package 'sf' is required.")
@@ -49,6 +23,11 @@ tab2relweights_sfdep <- function(rel_layer,
 
   n_rel <- nrow(rel_layer)
   n_inh <- nrow(inh_layer)
+
+  if (n_rel == 0 || n_inh == 0) {
+    rel_ids <- if (!is.null(ids)) as.character(ids) else character(n_rel)
+    return(empty_sfdep_result(rel_ids, style, zero.policy, call_expr))
+  }
 
   if (!is.null(ids)) {
     if (length(ids) != n_rel) {
@@ -74,7 +53,14 @@ tab2relweights_sfdep <- function(rel_layer,
     rel_matrix <- incidence %*% t(incidence)
     diag(rel_matrix) <- 0
 
-    nb_list <- lapply(seq_len(n_rel), function(i) which(rel_matrix[i, ] > 0))
+    nb_list <- lapply(seq_len(n_rel), function(i) {
+      neighbours <- which(rel_matrix[i, ] > 0)
+      if (length(neighbours) == 0) {
+        integer(0)
+      } else {
+        as.integer(neighbours)
+      }
+    })
 
     if (binary) {
       base_weights <- ifelse(rel_matrix > 0, 1, 0)
@@ -84,13 +70,15 @@ tab2relweights_sfdep <- function(rel_layer,
   }
 
   styled_weights <- apply_style(base_weights, style, zero.policy)
-  nb_list <- ensure_nb(nb_list, rel_ids)
+  nb_struct <- ensure_nb(nb_list, rel_ids, call_expr)
   weights_list <- matrix_to_weight_list(styled_weights, nb_list, style)
+  nb_clean <- strip_zero_neighbours(nb_list)
 
-  listw <- sfdep::recreate_listw(nb_list, weights_list)
+  listw <- sfdep::recreate_listw(nb_struct, weights_list)
+  attr(listw, "zero.policy") <- zero.policy
   tidy_df <- data.frame(
     id = rel_ids,
-    nb = I(nb_list),
+    nb = I(nb_clean),
     wt = I(weights_list),
     stringsAsFactors = FALSE
   )
@@ -102,19 +90,46 @@ tab2relweights_sfdep <- function(rel_layer,
   list(rel_matrix = rel_matrix,
        weights = base_weights,
        weights_styled = styled_weights,
-       nb = nb_list,
+       nb = nb_struct,
+       weights_list = weights_list,
+       listw = listw,
+       sfdep = tidy_df)
+}
+
+empty_sfdep_result <- function(rel_ids, style, zero.policy, call_expr) {
+  n_rel <- length(rel_ids)
+  rel_matrix <- matrix(0, nrow = n_rel, ncol = n_rel)
+  base_weights <- rel_matrix
+  styled_weights <- apply_style(base_weights, style, zero.policy)
+  nb_list <- replicate(n_rel, integer(0), simplify = FALSE)
+  nb_struct <- ensure_nb(nb_list, rel_ids, call_expr)
+  weights_list <- matrix_to_weight_list(styled_weights, nb_list, style)
+  listw <- sfdep::recreate_listw(nb_struct, weights_list)
+  attr(listw, "zero.policy") <- zero.policy
+  tidy_df <- data.frame(
+    id = rel_ids,
+    nb = I(strip_zero_neighbours(nb_list)),
+    wt = I(weights_list),
+    stringsAsFactors = FALSE
+  )
+
+  list(rel_matrix = rel_matrix,
+       weights = base_weights,
+       weights_styled = styled_weights,
+       nb = nb_struct,
        weights_list = weights_list,
        listw = listw,
        sfdep = tidy_df)
 }
 
 # Helper: ensure neighbour list carries expected metadata
-ensure_nb <- function(nb_list, ids) {
+ensure_nb <- function(nb_list, ids, call_expr) {
   nb_list <- lapply(nb_list, function(x) as.integer(x))
-  class(nb_list) <- c("nb", "list")
+  class(nb_list) <- "nb"
   attr(nb_list, "region.id") <- ids
   attr(nb_list, "sym") <- TRUE
   attr(nb_list, "type") <- "relational"
+  attr(nb_list, "call") <- call_expr
   nb_list
 }
 
@@ -124,6 +139,7 @@ matrix_to_weight_list <- function(mat, nb_list, style) {
   wt <- vector("list", length = n)
   for (i in seq_len(n)) {
     neighbours <- nb_list[[i]]
+    neighbours <- neighbours[neighbours > 0]
     if (length(neighbours) == 0) {
       wt[[i]] <- numeric(0)
     } else {
@@ -132,6 +148,17 @@ matrix_to_weight_list <- function(mat, nb_list, style) {
   }
   attr(wt, style) <- TRUE
   wt
+}
+
+strip_zero_neighbours <- function(nb_list) {
+  lapply(nb_list, function(x) {
+    if (length(x) == 0) {
+      integer(0)
+    } else {
+      x <- x[x > 0]
+      if (length(x) == 0) integer(0) else x
+    }
+  })
 }
 
 # Helper: apply weighting style with basic support for W and B
@@ -157,8 +184,11 @@ write_gal <- function(nb_list, ids, path) {
   con <- file(path, open = "w", encoding = "UTF-8")
   on.exit(close(con), add = TRUE)
 
+  writeLines(as.character(length(nb_list)), con)
+
   for (i in seq_along(nb_list)) {
     neighbours <- nb_list[[i]]
+    neighbours <- neighbours[neighbours > 0]
     line_one <- sprintf("%s %d", ids[i], length(neighbours))
     writeLines(line_one, con)
     if (length(neighbours) == 0) {
